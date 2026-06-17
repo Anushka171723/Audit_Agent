@@ -1,0 +1,7 @@
+pytesseract
+Pillow
+langchain
+langchain-groq
+pydantic
+python-dotenv
+streamlit
