@@ -1,5 +1,6 @@
 pytesseract
 Pillow
+PyMuPDF
 langchain
 langchain-groq
 pydantic

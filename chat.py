@@ -13,6 +13,7 @@ from database import (
     get_invoice_count,
     get_invoice_by_number,
     get_duplicate_invoices,
+    get_invoices_by_category,
     check_duplicate_invoice,
 )
 from ocr import extract_text_from_image
@@ -27,7 +28,7 @@ def _save_raw_text(text: str, output_path: str) -> None:
 
 @tool("OCRTool")
 def ocr_tool(image_path: str) -> str:
-    """Extract text from an invoice image, convert it into structured data, and save OCR outputs."""
+    """Extract text from an invoice image or PDF, convert it into structured data, and save OCR outputs."""
     raw_text = extract_text_from_image(image_path)
     invoice_data = parse_invoice_text(raw_text)
 
@@ -83,17 +84,9 @@ def report_tool(audit_report_path: str = "outputs/audit_report.txt") -> str:
 
 
 @tool("ListInvoicesTool")
-def list_invoices_tool(limit: int = 25) -> str:
-    """Return a summary of recent invoices stored in MongoDB."""
-    invoices = get_all_invoices()[:limit]
-    if not invoices:
-        return "No invoices are stored in the database yet."
-
-    lines = [
-        f"{invoice.get('invoice_no', 'UNKNOWN')} | {invoice.get('date', 'N/A')} | {invoice.get('vendor', 'N/A')} | {invoice.get('audit_status', 'unknown')} | {invoice.get('issue_count', 0)} issues"
-        for invoice in invoices
-    ]
-    return "\n".join(lines)
+def list_invoices_tool() -> str:
+    """Return every invoice stored in MongoDB."""
+    return format_invoice_list(get_all_invoices())
 
 
 @tool("GetInvoiceTool")
@@ -238,69 +231,287 @@ def _answer_with_local_rules(question: str, invoice_data: dict, audit_result: di
 
 
 def _format_invoice_record(invoice: dict) -> str:
+    amount = invoice.get('amount', 0)
+    tax = invoice.get('tax', 0)
+    total = invoice.get('total', 0)
+    
     return (
         f"Invoice No: {invoice.get('invoice_no')}\n"
-        f"Date: {invoice.get('date')}\n"
         f"Vendor: {invoice.get('vendor')}\n"
-        f"Category: {invoice.get('category', 'N/A')}\n"
-        f"Amount: {invoice.get('amount')}\n"
-        f"Tax: {invoice.get('tax')}\n"
-        f"Total: {invoice.get('total')}\n"
-        f"Status: {invoice.get('audit_status')}\n"
-        f"Issues: {invoice.get('issue_count')}\n"
+        f"Date: {invoice.get('date')}\n"
+        f"Customer: {invoice.get('customer_name', 'N/A')}\n"
+        f"Amount: ₹{amount:,.2f}\n"
+        f"Tax: ₹{tax:,.2f}\n"
+        f"Total: ₹{total:,.2f}\n"
+        f"Audit Status: {_display_status(invoice.get('audit_status'))}\n"
+        f"Issues: {invoice.get('issue_count', 0)}\n"
         f"Created: {invoice.get('created_at')}"
     )
 
 
+def _display_status(status: object) -> str:
+    status_text = str(status or "unknown").strip()
+
+    if not status_text:
+        return "Unknown"
+
+    if status_text.lower() == "passed":
+        return "Passed"
+
+    if status_text.lower() == "warning":
+        return "Warning"
+
+    if status_text.lower() == "failed":
+        return "Failed"
+
+    if status_text.lower() == "waiting":
+        return "Waiting"
+
+    return status_text[:1].upper() + status_text[1:]
+
+
+def format_invoice_list(invoices: list[dict], title: str = "Invoices in database:") -> str:
+    if not invoices:
+        return "No invoices are stored in the database yet."
+
+    lines = [title, ""]
+
+    for index, invoice in enumerate(invoices, start=1):
+        lines.append(
+            f"{index}. {invoice.get('invoice_no', 'UNKNOWN')} | "
+            f"{invoice.get('vendor', 'N/A')} | "
+            f"{_display_status(invoice.get('audit_status'))}"
+        )
+
+    return "\n".join(lines)
+
+
+def _format_invoice_numbers(invoices: list[dict]) -> str:
+    if not invoices:
+        return "No invoices are stored in the database yet."
+
+    numbers = [str(invoice.get("invoice_no", "UNKNOWN")) for invoice in invoices]
+    return "Invoice numbers in database:\n\n" + "\n".join(
+        f"{index}. {invoice_no}" for index, invoice_no in enumerate(numbers, start=1)
+    )
+
+
+def _is_invoice_collection_question(question_text: str) -> bool:
+    return bool(re.search(r"\binvoices\b", question_text)) and any(
+        word in question_text
+        for word in ["list", "show", "display", "give", "get", "fetch", "see"]
+    )
+
+
+def _is_invoice_number_collection_question(question_text: str) -> bool:
+    return _is_invoice_collection_question(question_text) and bool(
+        re.search(r"\binvoice\s*(?:numbers?|nos?)\b|\binv\s*(?:numbers?|nos?)\b", question_text)
+    )
+
+
 def _extract_invoice_no(question: str) -> str:
-    match = re.search(r"invoice\s*(?:number|no\.?|#)?\s*([A-Za-z0-9\-]+)", question, re.IGNORECASE)
+    match = re.search(
+        r"(?:find|show|display|get|lookup|search for)?\s*invoice\s*(?:number|no\.?|#)?\s*([A-Za-z0-9\-]+)",
+        question,
+        re.IGNORECASE,
+    )
     if match:
         return match.group(1).strip()
 
-    match = re.search(r"\b([A-Za-z0-9\-]{3,})\b", question)
+    match = re.search(r"\b([A-Za-z]{2,}\d+[A-Za-z0-9\-]*)\b", question)
     return match.group(1).strip() if match else ""
 
 
-def _answer_with_db(question: str) -> str:
+def _extract_invoice_number_from_query(question: str) -> str:
+    """Extract invoice number from patterns like 'invoice number XYZ', 'having invoice XYZ', etc."""
+    # Pattern: "invoice number", "invoice no", "invoice no.", "having invoice number", "having invoice"
+    # Captures everything after the pattern until end of sentence (handles spaces, slashes, dashes)
+    match = re.search(
+        r"(?:invoice\s*(?:number|no\.?)|having\s+invoice\s*(?:number|no\.?)?)\s+([A-Za-z0-9\s/\-]+?)(?:\s+(?:in|from|database|stored|to|for|check)|$|\.|\?)",
+        question,
+        re.IGNORECASE,
+    )
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def answer_database_question(question: str) -> str:
     question_text = question.lower()
 
-    if any(phrase in question_text for phrase in ["list all invoices", "list invoices", "all invoices", "show all invoices"]):
-        invoices = get_all_invoices()
-        if not invoices:
-            return "No invoices are stored in the database yet."
+    # Handle invoice number lookups FIRST (before category and generic checks)
+    if any(phrase in question_text for phrase in ["invoice number", "invoice no", "having invoice", "find invoice", "show invoice", "display invoice", "get invoice", "lookup invoice", "search invoice"]):
+        invoice_no = _extract_invoice_number_from_query(question)
+        if not invoice_no:
+            # Try alternative extraction
+            invoice_no = _extract_invoice_no(question)
+        
+        if invoice_no:
+            invoice = get_invoice_by_number(invoice_no)
+            if invoice:
+                # Format full invoice details
+                lines = [
+                    f"Invoice Number: {invoice.get('invoice_no', 'N/A')}",
+                    f"Vendor: {invoice.get('vendor', 'N/A')}",
+                    f"Date: {invoice.get('date', 'N/A')}",
+                    f"Category: {invoice.get('category', 'N/A')}",
+                    f"Status: {_display_status(invoice.get('audit_status'))}",
+                    f"Amount: ₹{invoice.get('amount', 0):,.2f}",
+                    f"Tax: ₹{invoice.get('tax', 0):,.2f}",
+                    f"Total: ₹{invoice.get('total', 0):,.2f}",
+                ]
+                return "\n".join(lines)
+            else:
+                return f"Invoice {invoice_no} not found in database."
 
-        lines = [
-            f"{invoice.get('invoice_no', 'UNKNOWN')} | {invoice.get('date', 'N/A')} | {invoice.get('vendor', 'N/A')} | {invoice.get('audit_status', 'unknown')} | {invoice.get('issue_count', 0)} issues"
-            for invoice in invoices[:25]
-        ]
+    # Handle category-based queries (before generic "show all" checks)
+    # Map keywords to categories
+    category_keywords = {
+        r"\bretail\b": "Retail",
+        r"\bamazon\b": "Retail",
+        r"\bflipkart\b": "Retail",
+        r"\bmedical\b|\bhospital\b|\bpharmacy\b|\bhealthcare\b": ["Medical", "Healthcare", "Pharmacy"],
+        r"\bhotel\b|\bhospitality\b": "Hospitality",
+        r"\brestaurant\b|\bcafe\b|\bfood\b": "Food",
+        r"\btravel\b|\bflight\b|\bairline\b": "Travel",
+        r"\bservice\b|\bservices\b": "Services",
+        r"\butility\b|\butilities\b|\belectricity\b|\bwater\b|\bgas\b": "Utilities",
+    }
+    
+    matched_categories = []
+    for keyword_pattern, categories in category_keywords.items():
+        if re.search(keyword_pattern, question_text, re.IGNORECASE):
+            if isinstance(categories, list):
+                matched_categories.extend(categories)
+            else:
+                matched_categories.append(categories)
+    
+    if matched_categories:
+        # Search for invoices in matched categories
+        all_matches = []
+        for category in matched_categories:
+            invoices = get_invoices_by_category(category)
+            all_matches.extend(invoices)
+        
+        # Remove duplicates by invoice_no
+        seen = set()
+        unique_invoices = []
+        for invoice in all_matches:
+            inv_no = invoice.get("invoice_no")
+            if inv_no not in seen:
+                seen.add(inv_no)
+                unique_invoices.append(invoice)
+        
+        if not unique_invoices:
+            category_display = " / ".join(set(matched_categories))
+            return f"No invoices found for category '{category_display}'."
+        
+        # Format results
+        category_display = matched_categories[0]
+        lines = [f"{category_display} Invoices Found ({len(unique_invoices)} total):", ""]
+        for index, invoice in enumerate(unique_invoices, start=1):
+            lines.append(f"{index}. {invoice.get('invoice_no', 'UNKNOWN')} - {invoice.get('vendor', 'N/A')} - {_display_status(invoice.get('audit_status'))}")
+        
         return "\n".join(lines)
 
-    if "show invoice" in question_text or "display invoice" in question_text:
-        invoice_no = _extract_invoice_no(question)
+    if any(
+        phrase in question_text
+        for phrase in [
+            "how many invoices are stored",
+            "how many invoices are in database",
+            "how many invoices in database",
+            "how many invoices",
+            "how many are stored",
+            "total invoices",
+            "invoice count",
+            "count invoices",
+        ]
+    ):
+        count = get_invoice_count()
+        return f"There are {count} invoices stored in the database."
 
-        if not invoice_no:
-            return "Please provide an invoice number like INV001 to look up."
+    if any(
+        phrase in question_text
+        for phrase in [
+            "show duplicate invoices",
+            "duplicate invoices",
+            "list duplicate invoices",
+            "list duplicates",
+        ]
+    ):
+        duplicates = get_duplicate_invoices()
+        if not duplicates:
+            return "No duplicate invoices were found in the database."
 
-        invoice = get_invoice_by_number(invoice_no)
-        if not invoice:
-            return f"No invoice record found for {invoice_no}."
+        return format_invoice_list(duplicates, "Duplicate invoices in database:")
 
-        return _format_invoice_record(invoice)
-
-    if "show failed invoices" in question_text or "failed invoices" in question_text:
+    if any(
+        phrase in question_text
+        for phrase in [
+            "show failed invoices",
+            "failed invoices",
+            "list failed invoices",
+            "warning invoices",
+            "invoices with warnings",
+        ]
+    ):
         invoices = get_failed_invoices()
         if not invoices:
             return "No failed invoices are stored in the database."
 
-        lines = [
-            f"{invoice.get('invoice_no', 'UNKNOWN')} | {invoice.get('date', 'N/A')} | {invoice.get('vendor', 'N/A')} | {invoice.get('audit_status', 'unknown')}"
-            for invoice in invoices
-        ]
-        return "\n".join(lines)
+        return format_invoice_list(invoices, "Failed or warning invoices in database:")
 
-    if any(phrase in question_text for phrase in ["how many invoices", "how many are stored", "total invoices", "invoice count"]):
-        count = get_invoice_count()
-        return f"There are {count} invoices stored in the database."
+    if any(
+        phrase in question_text
+        for phrase in [
+            "show passed invoices",
+            "passed invoices",
+            "list passed invoices",
+            "approved invoices",
+            "give me invoices that passed",
+            "invoices that passed",
+        ]
+    ):
+        invoices = [
+            invoice
+            for invoice in get_all_invoices()
+            if str(invoice.get("audit_status", "")).lower() == "passed"
+        ]
+        if not invoices:
+            return "No passed invoices are stored in the database."
+
+        return format_invoice_list(invoices, "Passed invoices in database:")
+
+    if any(
+        phrase in question_text
+        for phrase in [
+            "show all invoice numbers",
+            "show all invoice number",
+            "list all invoice numbers",
+            "list all invoice number",
+            "all invoice numbers",
+            "all invoice number",
+            "invoice numbers",
+        ]
+    ) or _is_invoice_number_collection_question(question_text):
+        invoices = get_all_invoices()
+        return _format_invoice_numbers(invoices)
+
+    if any(
+        phrase in question_text
+        for phrase in [
+            "list all invoices",
+            "list the invoices",
+            "list invoices",
+            "all invoices",
+            "show all invoices",
+            "show the invoices",
+            "invoices in database",
+            "stored invoices",
+        ]
+    ) or _is_invoice_collection_question(question_text):
+        invoices = get_all_invoices()
+        return format_invoice_list(invoices)
 
     if "is invoice" in question_text and "approved" in question_text:
         invoice_no = _extract_invoice_no(question)
@@ -318,14 +529,6 @@ def _answer_with_db(question: str) -> str:
             return f"Invoice {invoice_no} is still pending review."
         return f"No. Invoice {invoice_no} is not approved. Status: {status}."
 
-    if "duplicate invoices" in question_text or "list duplicate" in question_text:
-        duplicates = get_duplicate_invoices()
-        if not duplicates:
-            return "No duplicate invoices were found in the database."
-
-        invoice_numbers = sorted({invoice["invoice_no"] for invoice in duplicates})
-        return "Duplicate invoices found: " + ", ".join(invoice_numbers)
-
     if "duplicate" in question_text:
         invoice_no = _extract_invoice_no(question)
         if invoice_no:
@@ -335,6 +538,42 @@ def _answer_with_db(question: str) -> str:
             )
 
     return ""
+
+
+def _is_audit_specific_question(question: str) -> bool:
+    """
+    Detect if a question is about the current invoice's audit findings.
+    These questions should use the loaded invoice_data and audit_report,
+    not MongoDB.
+    """
+    question_text = question.lower()
+    audit_keywords = [
+        "why did",
+        "why did this invoice fail",
+        "why did the invoice fail",
+        "what issues",
+        "what issues are in",
+        "what problems",
+        "explain the audit",
+        "explain the findings",
+        "explain audit findings",
+        "is this invoice safe",
+        "is it safe to approve",
+        "should i approve",
+        "audit findings",
+        "audit result",
+        "audit issues",
+        "audit problems",
+        "risk score",
+        "risk level",
+        "what's the risk",
+        "audit status",
+    ]
+    return any(phrase in question_text for phrase in audit_keywords)
+
+
+def _answer_with_db(question: str) -> str:
+    return answer_database_question(question)
 
 
 def _answer_with_groq(question: str, invoice_data: dict, audit_report: str) -> str:
@@ -357,14 +596,22 @@ def answer_audit_question(question: str, use_llm: bool = True) -> str:
     audit_result = context["audit_result"]
     audit_report = context["audit_report"]
 
-    db_answer = _answer_with_db(question)
-    if db_answer:
-        return db_answer
+    # Check if this is an audit-specific question about the currently loaded invoice
+    is_audit_specific = _is_audit_specific_question(question)
 
+    if not is_audit_specific:
+        # For general invoice queries, search MongoDB first
+        db_answer = _answer_with_db(question)
+        if db_answer:
+            return db_answer
+        # If MongoDB search returns nothing for a general query, say so
+        return "No invoice data found matching your query. Try asking about the currently loaded invoice's audit findings."
+
+    # For audit-specific questions, use current invoice context
     if not invoice_data or not audit_result:
         return (
             "I cannot find extracted data or an audit report yet for invoice-specific questions. "
-            "Run the OCR and audit first or ask a MongoDB-backed query like 'List all invoices'."
+            "Run the OCR and audit first or ask a general invoice query like 'List all invoices'."
         )
 
     if use_llm and os.getenv("GROQ_API_KEY"):

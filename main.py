@@ -9,7 +9,7 @@ load_dotenv()
 
 from audit import audit_invoice, create_audit_summary
 from chat import start_chat
-from ocr import extract_text_from_image
+from ocr import extract_text_from_file
 from parser import parse_invoice_text, save_csv, save_json
 
 
@@ -23,7 +23,7 @@ def extract_command(args: argparse.Namespace) -> None:
     image_path = args.file
 
     print("Reading image and running OCR...")
-    raw_text = extract_text_from_image(image_path)
+    raw_text = extract_text_from_file(image_path)
 
     parser_mode = "Groq structured extraction" if os.getenv("GROQ_API_KEY") else "rule parser"
     print(f"Converting OCR text into structured data using {parser_mode}...")
@@ -65,7 +65,7 @@ def run_command(args: argparse.Namespace) -> None:
     image_path = args.file
 
     print("Step 1: Reading image and running OCR...")
-    raw_text = extract_text_from_image(image_path)
+    raw_text = extract_text_from_file(image_path)
 
     parser_mode = "Groq structured extraction" if os.getenv("GROQ_API_KEY") else "rule parser"
     print(f"Step 2: Converting OCR text into structured data using {parser_mode}...")
@@ -91,16 +91,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="CLI Audit Agent - Day 1 OCR extraction")
     subparsers = parser.add_subparsers(dest="command")
 
-    extract_parser = subparsers.add_parser("extract", help="Extract invoice data from an image")
-    extract_parser.add_argument("--file", required=True, help="Path to invoice image file")
+    extract_parser = subparsers.add_parser("extract", help="Extract invoice data from an image or PDF")
+    extract_parser.add_argument("--file", required=True, help="Path to invoice image or PDF file")
     extract_parser.set_defaults(func=extract_command)
 
     audit_parser = subparsers.add_parser("audit", help="Audit extracted invoice data")
     audit_parser.add_argument("--file", required=True, help="Path to extracted JSON data")
     audit_parser.set_defaults(func=audit_command)
 
-    run_parser = subparsers.add_parser("run", help="Extract and audit invoice data from an image")
-    run_parser.add_argument("--file", required=True, help="Path to invoice image file")
+    run_parser = subparsers.add_parser("run", help="Extract and audit invoice data from an image or PDF")
+    run_parser.add_argument("--file", required=True, help="Path to invoice image or PDF file")
     run_parser.set_defaults(func=run_command)
 
     chat_parser = subparsers.add_parser("chat", help="Chat with the audit report")
