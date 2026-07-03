@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from datetime import datetime, date
 from pathlib import Path
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -15,9 +16,11 @@ from database import (
     get_duplicate_invoices,
     get_invoices_by_category,
     check_duplicate_invoice,
+    get_invoices_by_date,
 )
 from ocr import extract_text_from_image
 from parser import parse_invoice_text, save_csv, save_json
+
 
 
 def _save_raw_text(text: str, output_path: str) -> None:
@@ -97,6 +100,7 @@ def get_invoice_tool(invoice_no: str) -> str:
         return f"Invoice {invoice_no} was not found."
 
     return json.dumps(invoice, default=str, indent=2)
+
 
 
 @tool("FailedInvoicesTool")
@@ -286,6 +290,77 @@ def format_invoice_list(invoices: list[dict], title: str = "Invoices in database
     return "\n".join(lines)
 
 
+def format_invoice_list_with_category(invoices: list[dict], title: str = "Invoices grouped by category:") -> str:
+    """Return styled HTML table of invoices grouped by category."""
+    if not invoices:
+        return "No invoices are stored in the database yet."
+
+    from collections import defaultdict
+    grouped: dict = defaultdict(list)
+    for invoice in invoices:
+        category = (invoice.get("category") or "Uncategorized").strip()
+        grouped[category].append(invoice)
+
+    STATUS_COLORS = {
+        "passed":  ("#16a34a", "#dcfce7"),
+        "failed":  ("#dc2626", "#fee2e2"),
+        "warning": ("#d97706", "#fef3c7"),
+    }
+
+    def badge(status: str) -> str:
+        key = str(status or "").lower()
+        color, bg = STATUS_COLORS.get(key, ("#64748b", "#f1f5f9"))
+        label = _display_status(status)
+        return (
+            f'<span style="background:{bg};color:{color};border:1px solid {color};'
+            f'border-radius:4px;padding:2px 8px;font-size:0.78rem;font-weight:700;">'
+            f'{label}</span>'
+        )
+
+    html_parts = [
+        '<style>'
+        '.inv-table{width:100%;border-collapse:collapse;font-size:0.88rem;margin-bottom:10px;}'
+        '.inv-table th{background:#1e293b;color:#94a3b8;padding:7px 10px;text-align:left;font-weight:600;}'
+        '.inv-table td{padding:7px 10px;border-bottom:1px solid #1e293b;color:#e2e8f0;}'
+        '.inv-table tr:hover td{background:rgba(99,102,241,0.08);}'
+        '.cat-heading{color:#a5b4fc;font-weight:700;font-size:0.95rem;margin:14px 0 4px;}'
+        '.inv-summary{color:#94a3b8;font-size:0.82rem;margin-top:8px;}'
+        '</style>',
+        f'<div style="font-weight:700;font-size:1rem;color:#e2e8f0;margin-bottom:8px;">{title}</div>',
+    ]
+
+    total = 0
+    for category in sorted(grouped.keys()):
+        cat_invoices = grouped[category]
+        total += len(cat_invoices)
+        html_parts.append(
+            f'<div class="cat-heading">📂 {category} &nbsp;'
+            f'<span style="color:#64748b;font-size:0.8rem;font-weight:400;">'
+            f'({len(cat_invoices)} invoice{"s" if len(cat_invoices) != 1 else ""})</span></div>'
+        )
+        html_parts.append(
+            '<table class="inv-table">'
+            '<thead><tr><th>#</th><th>Invoice No</th><th>Vendor</th><th>Status</th></tr></thead><tbody>'
+        )
+        for i, inv in enumerate(cat_invoices, 1):
+            html_parts.append(
+                f'<tr>'
+                f'<td style="color:#64748b;">{i}</td>'
+                f'<td style="font-family:monospace;color:#818cf8;">{inv.get("invoice_no","UNKNOWN")}</td>'
+                f'<td>{inv.get("vendor","N/A")}</td>'
+                f'<td>{badge(inv.get("audit_status"))}</td>'
+                f'</tr>'
+            )
+        html_parts.append('</tbody></table>')
+
+    html_parts.append(
+        f'<div class="inv-summary">Total: {total} invoices across {len(grouped)} categories.</div>'
+    )
+    return "".join(html_parts)
+
+
+
+
 def _format_invoice_numbers(invoices: list[dict]) -> str:
     if not invoices:
         return "No invoices are stored in the database yet."
@@ -339,7 +414,33 @@ def _extract_invoice_number_from_query(question: str) -> str:
 def answer_database_question(question: str) -> str:
     question_text = question.lower()
 
-    # Handle invoice number lookups FIRST (before category and generic checks)
+    # 1. Handle specific failure reason queries first
+    if "why did" in question_text and ("fail" in question_text or "warning" in question_text or "passed" in question_text or "audit" in question_text or "issue" in question_text):
+        invoice_no = _extract_invoice_number_from_query(question) or _extract_invoice_no(question)
+        if invoice_no:
+            invoice = get_invoice_by_number(invoice_no)
+            if invoice:
+                status = _display_status(invoice.get("audit_status"))
+                issues = invoice.get("issues", [])
+                if not issues and status == "Passed":
+                    return f"Invoice {invoice_no} passed the audit with a risk score of {invoice.get('risk_score', 100)}/100 and has no issues."
+                
+                issue_lines = []
+                for idx, issue in enumerate(issues, 1):
+                    severity = str(issue.get("severity", "unknown")).upper()
+                    field = str(issue.get("field", "unknown")).replace("_", " ").title()
+                    msg = issue.get("message", "")
+                    issue_lines.append(f"{idx}. **[{severity}]** {field}: {msg}")
+                
+                issues_str = "\n".join(issue_lines)
+                return (
+                    f"Invoice {invoice_no} has status **{status}** (Risk Score: {invoice.get('risk_score', 100)}/100).\n\n"
+                    f"**Audit Findings/Issues:**\n{issues_str}"
+                )
+            else:
+                return f"Invoice {invoice_no} was not found in the database."
+
+    # 2. Handle invoice number lookups (before category and generic checks)
     if any(phrase in question_text for phrase in ["invoice number", "invoice no", "having invoice", "find invoice", "show invoice", "display invoice", "get invoice", "lookup invoice", "search invoice"]):
         invoice_no = _extract_invoice_number_from_query(question)
         if not invoice_no:
@@ -364,19 +465,50 @@ def answer_database_question(question: str) -> str:
             else:
                 return f"Invoice {invoice_no} not found in database."
 
-    # Handle category-based queries (before generic "show all" checks)
-    # Map keywords to categories
+    # 3. Handle today's invoices queries
+    if "today" in question_text:
+        today_str = datetime.today().strftime("%Y-%m-%d")
+        invoices = get_invoices_by_date(today_str)
+        if not invoices:
+            # Fallback check on datetime created_at timestamps
+            all_invoices = get_all_invoices()
+            today_invs = []
+            for inv in all_invoices:
+                created = inv.get("created_at")
+                if created:
+                    if isinstance(created, datetime):
+                        if created.date() == date.today():
+                            today_invs.append(inv)
+                    elif today_str in str(created):
+                        today_invs.append(inv)
+            invoices = today_invs
+
+        if invoices:
+            return format_invoice_list_with_category(invoices, f"Invoices recorded today ({today_str}):")
+        return f"No invoices have been recorded today ({today_str})."
+
+    # 4. Intercept vendor-specific query (e.g. "Show Amazon invoices")
+    vendor_match = re.search(r"(?:show|list|get|find|display)\s+(?:me\s+)?([A-Za-z0-9\-]+?)\s+invoices", question_text)
+    if vendor_match:
+        vendor_name = vendor_match.group(1).strip()
+        if vendor_name not in ["all", "retail", "medical", "hospital", "pharmacy", "healthcare", "hotel", "hospitality", "restaurant", "cafe", "food", "travel", "flight", "airline", "service", "services", "utility", "utilities", "failed", "warning", "passed", "approved", "duplicate", "today", "todays"]:
+            invoices = get_invoices_by_category(vendor_name)
+            if invoices:
+                return format_invoice_list_with_category(invoices, f"Invoices matching vendor/keyword '{vendor_name}':")
+            else:
+                return f"No invoices found matching vendor/keyword '{vendor_name}'."
+
+    # Map keywords to categories (removed vendor specific keywords like amazon, flipkart)
     category_keywords = {
         r"\bretail\b": "Retail",
-        r"\bamazon\b": "Retail",
-        r"\bflipkart\b": "Retail",
-        r"\bmedical\b|\bhospital\b|\bpharmacy\b|\bhealthcare\b": ["Medical", "Healthcare", "Pharmacy"],
+        r"\bmedical\b|\bhospital\b|\bpharmacy\b|\bhealthcare\b|\bhealth\s*care\b|\bhealth\b|\bclinic\b|\bmedicine\b|\bdrug\b": ["Medical", "Healthcare", "Pharmacy", "Health"],
         r"\bhotel\b|\bhospitality\b": "Hospitality",
         r"\brestaurant\b|\bcafe\b|\bfood\b": "Food",
         r"\btravel\b|\bflight\b|\bairline\b": "Travel",
         r"\bservice\b|\bservices\b": "Services",
         r"\butility\b|\butilities\b|\belectricity\b|\bwater\b|\bgas\b": "Utilities",
     }
+
     
     matched_categories = []
     for keyword_pattern, categories in category_keywords.items():
@@ -497,6 +629,23 @@ def answer_database_question(question: str) -> str:
         invoices = get_all_invoices()
         return _format_invoice_numbers(invoices)
 
+    # Handle "all invoices with their categories" / "show categories" queries
+    if any(
+        phrase in question_text
+        for phrase in [
+            "with their categories",
+            "with categories",
+            "and their categories",
+            "and categories",
+            "show categories",
+            "list categories",
+            "invoices and category",
+            "invoices with category",
+        ]
+    ):
+        invoices = get_all_invoices()
+        return format_invoice_list_with_category(invoices)
+
     if any(
         phrase in question_text
         for phrase in [
@@ -509,7 +658,10 @@ def answer_database_question(question: str) -> str:
             "invoices in database",
             "stored invoices",
         ]
-    ) or _is_invoice_collection_question(question_text):
+    ) or (
+        _is_invoice_collection_question(question_text)
+        and not matched_categories  # don't override a category match
+    ):
         invoices = get_all_invoices()
         return format_invoice_list(invoices)
 

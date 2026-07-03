@@ -152,11 +152,53 @@ def get_duplicate_invoices() -> list[dict]:
 
 
 def get_invoices_by_category(category: str) -> list[dict]:
-    """Return all invoices matching the given category."""
+    """Return all invoices matching the given category (exact field first, then keyword fallback)."""
     if not category:
         return []
     coll = _get_collection()
-    return list(coll.find({"category": {"$regex": f"^{category}$", "$options": "i"}}).sort("created_at", -1))
+    # 1. Try exact category field match first (case-insensitive)
+    results = list(coll.find({"category": {"$regex": f"^{re.escape(category)}$", "$options": "i"}}).sort("created_at", -1))
+    if results:
+        return results
+    # 2. Fallback: partial match on category, vendor, or description fields
+    keyword_pattern = re.escape(category)
+    results = list(coll.find({
+        "$or": [
+            {"category": {"$regex": keyword_pattern, "$options": "i"}},
+            {"vendor": {"$regex": keyword_pattern, "$options": "i"}},
+            {"description": {"$regex": keyword_pattern, "$options": "i"}},
+        ]
+    }).sort("created_at", -1))
+    return results
+
+
+def get_invoices_by_date(date_str: str) -> list[dict]:
+    """Return all invoices matching the given date string (YYYY-MM-DD or partial)."""
+    if not date_str:
+        return []
+    coll = _get_collection()
+    return list(coll.find({"date": {"$regex": re.escape(date_str), "$options": "i"}}).sort("created_at", -1))
+
+
+def search_invoices(query_params: dict) -> list[dict]:
+    """Search for invoices by multiple criteria."""
+    coll = _get_collection()
+    mongo_query = {}
+    
+    for field, val in query_params.items():
+        if not val:
+            continue
+        val_str = str(val).strip()
+        if field in ["invoice_no", "vendor", "customer_name", "gstin", "category"]:
+            mongo_query[field] = {"$regex": re.escape(val_str), "$options": "i"}
+        elif field == "date":
+            mongo_query[field] = {"$regex": re.escape(val_str), "$options": "i"}
+        elif field in ["audit_status", "status"]:
+            mongo_query["audit_status"] = {"$regex": f"^{re.escape(val_str)}$", "$options": "i"}
+        elif field == "classification":
+            mongo_query["classification"] = {"$regex": f"^{re.escape(val_str)}$", "$options": "i"}
+
+    return list(coll.find(mongo_query).sort("created_at", -1))
 
 
 def update_invoice_record(invoice_no: str, updates: dict) -> bool:
@@ -166,3 +208,4 @@ def update_invoice_record(invoice_no: str, updates: dict) -> bool:
     coll = _get_collection()
     result = coll.update_one({"invoice_no": invoice_no}, {"$set": updates})
     return result.matched_count > 0
+

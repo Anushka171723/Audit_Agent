@@ -49,6 +49,7 @@ Rules:
    * invoice date
    * GSTIN if present
    * category
+   * classification (Determine if it is a 'Purchase', 'Sales', or 'Expense'. 'Sales' if issued by us to a customer; 'Purchase' if B2B inventory, services, raw materials, or trade; 'Expense' if travel, utility bills, food/restaurant, medical/hospital, operational consumables, office supplies, or retail items).
    * subtotal amount
    * discount if present
    * total tax
@@ -70,7 +71,7 @@ Possible values:
 * utility_invoice
 * other
 
-4. Extract line items if present.
+4. Extract line items if present, including the product name, HSN/SAC code if present, quantity, unit price, and total amount.
 
 5. Calculate total tax using:
 
@@ -135,6 +136,7 @@ Required Output Schema:
 "customer_name": "",
 "gstin": "",
 "category": "",
+"classification": "Purchase",
 "amount": 0,
 "discount": 0,
 "tax": 0,
@@ -143,7 +145,8 @@ Required Output Schema:
 "ocr_quality": "",
 "items": [
 {{
-"description": "",
+"product": "",
+"hsn_sac": "",
 "quantity": 0,
 "unit_price": 0,
 "amount": 0
@@ -155,6 +158,7 @@ Required Output Schema:
 OCR Text:
 
 {ocr_text}"""
+
 
 
 DOCUMENT_TYPES = {
@@ -200,15 +204,64 @@ def _to_number(value: object) -> float:
 
 
 def _normalise_item(item: dict) -> dict:
+    description = str(item.get("description") or item.get("product") or "").strip()
     return {
-        "description": str(item.get("description") or "").strip(),
+        "product": description,
+        "hsn_sac": str(item.get("hsn_sac") or "").strip(),
         "quantity": _to_number(item.get("quantity")),
         "unit_price": _to_number(item.get("unit_price")),
         "amount": _to_number(item.get("amount")),
     }
 
 
-def _normalise_invoice_data(data: dict) -> dict:
+def _classify_invoice(data: dict, text: str) -> str:
+    classification = str(data.get("classification") or "").strip().title()
+    if classification in ["Purchase", "Sales", "Expense"]:
+        return classification
+    
+    doc_type = str(data.get("document_type") or "").strip().lower()
+    category = str(data.get("category") or "").strip().lower()
+    text_lower = text.lower()
+    
+    # 1. Expense: Electricity bill, Internet bill, Hotel bill, Restaurant bill, Fuel bill, Travel/Cab/Flight bill, Hospital/Medical
+    expense_keywords = [
+        "electricity", "power bill", "water bill", "gas bill", "broadband", "internet", "telecom", "telephonic",
+        "hotel", "stay", "room charge", "lodging", "restaurant", "cafe", "food", "dining", "meal",
+        "fuel", "petrol", "diesel", "cng", "travel", "flight", "boarding pass", "cab", "taxi", "uber", "ola",
+        "hospital", "medical", "pharmacy", "medicine", "doctor"
+    ]
+    if doc_type in ["hotel_invoice", "restaurant_invoice", "travel_invoice", "utility_invoice", "hospital_invoice"]:
+        return "Expense"
+    if category in ["food", "hospitality", "travel", "utilities", "healthcare"]:
+        return "Expense"
+    if any(kw in text_lower for kw in expense_keywords):
+        return "Expense"
+        
+    # 2. Sales: Invoices issued to customers (we are selling goods/services)
+    sales_indicators = [
+        "sales invoice", "tax invoice to", "sold to", "bill to", "invoice to customer", "sales receipt"
+    ]
+    # If the vendor name is our default business or if there are customer details but we are the vendor
+    if any(kw in text_lower for kw in sales_indicators):
+        return "Sales"
+        
+    # 3. Purchase: Invoices received from suppliers (e.g. Amazon, Flipkart, wholesalers, distributors, retail vendors)
+    purchase_keywords = [
+        "amazon", "flipkart", "supplier", "wholesaler", "distributor", "purchase order", "po no", 
+        "dealer", "trader", "manufacturer", "distributors", "sold by", "shipped from"
+    ]
+    if doc_type in ["amazon_invoice", "flipkart_invoice", "retail_invoice"]:
+        return "Purchase"
+    if category in ["retail", "office supplies"]:
+        return "Purchase"
+    if any(kw in text_lower for kw in purchase_keywords):
+        return "Purchase"
+        
+    return "Purchase"  # default fallback
+
+
+
+def _normalise_invoice_data(data: dict, raw_text: str = "") -> dict:
     document_type = str(data.get("document_type") or "").strip().lower()
     ocr_quality = str(data.get("ocr_quality") or "").strip().lower()
     items = data.get("items") if isinstance(data.get("items"), list) else []
@@ -219,6 +272,8 @@ def _normalise_invoice_data(data: dict) -> dict:
     if not category or (category.lower() == "other" and document_category != "Other"):
         category = document_category
 
+    classification = _classify_invoice(data, raw_text)
+
     normalised = {
         "document_type": normalised_document_type,
         "invoice_no": str(data.get("invoice_no") or "").strip(),
@@ -227,6 +282,7 @@ def _normalise_invoice_data(data: dict) -> dict:
         "customer_name": str(data.get("customer_name") or "").strip(),
         "gstin": str(data.get("gstin") or "").strip(),
         "category": category,
+        "classification": classification,
         "amount": _to_number(data.get("amount")),
         "discount": _to_number(data.get("discount")),
         "tax": _to_number(data.get("tax")),
@@ -238,6 +294,7 @@ def _normalise_invoice_data(data: dict) -> dict:
     }
 
     return _add_derived_fields(normalised)
+
 
 
 def _money_pattern() -> str:
@@ -712,7 +769,7 @@ def parse_invoice_text_with_rules(text: str) -> dict:
     }
     invoice_data["ocr_quality"] = _ocr_quality(text, invoice_data)
 
-    return _normalise_invoice_data(invoice_data)
+    return _normalise_invoice_data(invoice_data, text)
 
 
 def _load_llm_json(content: str) -> dict:
@@ -732,7 +789,7 @@ def parse_invoice_text_with_groq(text: str) -> dict:
     response = llm.invoke(prompt)
     invoice_data = _load_llm_json(response.content)
 
-    return _normalise_invoice_data(invoice_data)
+    return _normalise_invoice_data(invoice_data, text)
 
 
 def is_valid_invoice(invoice_data: dict) -> bool:
@@ -783,6 +840,84 @@ def parse_invoice_text(text: str, use_llm: bool = True) -> dict:
     return parse_invoice_text_with_rules(text)
 
 
+def parse_natural_language_invoice(text: str) -> dict:
+    if os.getenv("GROQ_API_KEY"):
+        try:
+            from langchain_groq import ChatGroq
+            llm = ChatGroq(model=GROQ_EXTRACTION_MODEL, temperature=0)
+            
+            prompt = f"""You are an AI Invoice Creation System.
+Given a natural language description of a purchase or sale transaction, generate a complete structured invoice JSON.
+If details like invoice number, vendor, date, or unit prices are missing, generate realistic values (e.g., today's date for date, a sequential looking invoice number like 'INV-2026-1001', a generic vendor like 'Tech Retailers', and logical pricing for items if not specified).
+Calculate the totals, tax, and amounts correctly based on the items and GST percentage mentioned.
+
+Required Output Schema:
+{{
+"document_type": "retail_invoice",
+"invoice_no": "INV-YYYY-XXXX",
+"date": "YYYY-MM-DD",
+"vendor": "Vendor Name",
+"customer_name": "Customer Name",
+"gstin": "GSTIN (generate realistic 15-character Indian GSTIN if not specified but GST is mentioned)",
+"category": "Retail",
+"classification": "Sales",
+"amount": 0,
+"discount": 0,
+"tax": 0,
+"total": 0,
+"payment_method": "Cash",
+"ocr_quality": "good",
+"items": [
+  {{
+    "product": "Product/Item Name",
+    "hsn_sac": "HSN Code",
+    "quantity": 1,
+    "unit_price": 0,
+    "amount": 0
+  }}
+],
+"audit_flags": []
+}}
+
+Input Text:
+{text}"""
+            response = llm.invoke(prompt)
+            invoice_data = _load_llm_json(response.content)
+            return _normalise_invoice_data(invoice_data, text)
+        except Exception as error:
+            print(f"Groq natural language generation failed: {error}")
+            
+    # Fallback / Dummy invoice generation if Groq fails or API key not present
+    today_str = datetime.today().strftime("%Y-%m-%d")
+    fallback_data = {
+        "document_type": "retail_invoice",
+        "invoice_no": "INV-" + datetime.today().strftime("%Y%m%d") + "-01",
+        "date": today_str,
+        "vendor": "General Retailer Ltd",
+        "customer_name": "Customer",
+        "gstin": "27AAAAA1111A1Z5",
+        "category": "Retail",
+        "classification": "Sales",
+        "amount": 100.0,
+        "discount": 0.0,
+        "tax": 18.0,
+        "total": 118.0,
+        "payment_method": "Cash",
+        "ocr_quality": "good",
+        "items": [
+            {
+                "product": "Standard Item",
+                "hsn_sac": "8471",
+                "quantity": 1,
+                "unit_price": 100.0,
+                "amount": 100.0
+            }
+        ],
+        "audit_flags": []
+    }
+    return _normalise_invoice_data(fallback_data, text)
+
+
 def save_json(data: dict, output_path: str) -> None:
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -799,3 +934,4 @@ def save_csv(data: dict, output_path: str) -> None:
         writer = csv.DictWriter(file, fieldnames=data.keys())
         writer.writeheader()
         writer.writerow(data)
+

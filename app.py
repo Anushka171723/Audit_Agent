@@ -2,15 +2,29 @@ from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, date
 
 import database
-from database import save_invoice_record, get_invoice_by_number, update_invoice_record
+from database import (
+    save_invoice_record,
+    get_invoice_by_number,
+    update_invoice_record,
+    get_all_invoices,
+    search_invoices,
+)
 
 from audit import audit_invoice, create_audit_summary
 from chat import answer_audit_question
 from ocr import extract_text_from_file
-from parser import parse_invoice_text, save_csv, save_json, is_valid_invoice
+from parser import (
+    parse_invoice_text,
+    save_csv,
+    save_json,
+    is_valid_invoice,
+    _classify_invoice,
+)
+
+
 
 
 load_dotenv()
@@ -283,12 +297,20 @@ def money_label(value: object) -> str:
 
 
 def render_invoice_summary(invoice_data: dict) -> None:
+    cls = str(invoice_data.get("classification") or "Expense").strip().title()
+    cls_display = "🟠 Expense"
+    if cls == "Purchase":
+        cls_display = "🟢 Purchase"
+    elif cls == "Sales":
+        cls_display = "🔵 Sales"
+
     rows = [
         {"field": "document_type", "value": title_label(invoice_data.get("document_type"))},
         {"field": "invoice_no", "value": invoice_data.get("invoice_no") or "Missing"},
         {"field": "date", "value": invoice_data.get("date") or "Missing"},
         {"field": "vendor", "value": invoice_data.get("vendor") or "Missing"},
         {"field": "category", "value": invoice_data.get("category") or "Missing"},
+        {"field": "classification", "value": cls_display},
         {"field": "amount", "value": money_label(invoice_data.get("amount"))},
         {"field": "tax", "value": money_label(invoice_data.get("tax"))},
         {"field": "total", "value": money_label(invoice_data.get("total"))},
@@ -306,15 +328,17 @@ def render_line_items(invoice_data: dict) -> None:
     st.markdown("**Line Items**")
     rows = [
         {
-            "description": item.get("description", ""),
-            "quantity": item.get("quantity", 0),
-            "unit_price": item.get("unit_price", 0),
-            "amount": item.get("amount", 0),
+            "Product": item.get("product") or item.get("description", "N/A"),
+            "HSN/SAC": item.get("hsn_sac") or "N/A",
+            "Qty": item.get("quantity", 0),
+            "Unit Price": item.get("unit_price", 0),
+            "Amount": item.get("amount", 0),
         }
         for item in items
         if isinstance(item, dict)
     ]
     st.dataframe(rows, use_container_width=True, hide_index=True)
+
 
 
 def flag_label(flag: str) -> str:
@@ -421,7 +445,11 @@ def render_chat() -> None:
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
-            st.write(message["content"])
+            content = message["content"]
+            if content.startswith("<"):
+                st.markdown(content, unsafe_allow_html=True)
+            else:
+                st.write(content)
 
     question = st.chat_input("Why did this invoice fail?")
 
@@ -434,7 +462,10 @@ def render_chat() -> None:
         with st.chat_message("assistant"):
             with st.spinner("Analyzing invoice..."):
                 answer = answer_audit_question(question)
-            st.write(answer)
+            if answer.startswith("<"):
+                st.markdown(answer, unsafe_allow_html=True)
+            else:
+                st.write(answer)
 
         st.session_state.messages.append({"role": "assistant", "content": answer})
 
@@ -729,329 +760,545 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# --- Export Helpers ---
+
+def generate_invoice_csv(invoice_data: dict) -> str:
+    import io, csv
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["INVOICE REPORT", invoice_data.get("invoice_no", "")])
+    writer.writerow(["Vendor / Supplier", invoice_data.get("vendor", "")])
+    writer.writerow(["Invoice Date", invoice_data.get("date", "")])
+    writer.writerow(["Customer Name", invoice_data.get("customer_name", "")])
+    writer.writerow(["GSTIN", invoice_data.get("gstin", "")])
+    writer.writerow(["Category", invoice_data.get("category", "")])
+    writer.writerow(["Classification", invoice_data.get("classification", "Expense")])
+    writer.writerow([])
+    writer.writerow(["Product / Description", "HSN/SAC", "Qty", "Unit Price", "Amount"])
+    for item in invoice_data.get("items", []):
+        writer.writerow([
+            item.get("product") or item.get("description", ""),
+            item.get("hsn_sac", "N/A"),
+            item.get("quantity", 0),
+            item.get("unit_price", 0),
+            item.get("amount", 0)
+        ])
+    writer.writerow([])
+    writer.writerow(["Taxable Subtotal", invoice_data.get("amount", 0)])
+    writer.writerow(["Discount", invoice_data.get("discount", 0)])
+    writer.writerow(["Tax Amount", invoice_data.get("tax", 0)])
+    writer.writerow(["Grand Total", invoice_data.get("total", 0)])
+    return output.getvalue()
+
+
+def generate_invoice_pdf(invoice_data: dict, audit_result: dict) -> bytes:
+    import fitz
+    doc = fitz.open()
+    page = doc.new_page()
+    
+    # Title
+    page.insert_text((50, 60), "INVOICE AUDIT REPORT", fontsize=18, fontname="helvetica-bold", color=(0.1, 0.2, 0.4))
+    page.draw_line((50, 75), (550, 75), color=(0.1, 0.2, 0.4), width=1.5)
+    
+    # Meta details
+    y = 110
+    details = [
+        ("Invoice No:", invoice_data.get("invoice_no", "N/A")),
+        ("Vendor:", invoice_data.get("vendor", "N/A")),
+        ("Date:", invoice_data.get("date", "N/A")),
+        ("Customer:", invoice_data.get("customer_name", "N/A")),
+        ("GSTIN:", invoice_data.get("gstin", "N/A")),
+        ("Category:", invoice_data.get("category", "N/A")),
+        ("Classification:", invoice_data.get("classification", "Expense")),
+        ("Audit Status:", str(audit_result.get("status", "Unknown")).upper()),
+        ("Risk Score:", f"{audit_result.get('risk_score', 100)}/100"),
+    ]
+    
+    for label, val in details:
+        page.insert_text((50, y), label, fontsize=10, fontname="helvetica-bold")
+        page.insert_text((150, y), str(val), fontsize=10, fontname="helvetica")
+        y += 18
+        
+    y += 15
+    page.insert_text((50, y), "LINE ITEMS / PRODUCT TABLE", fontsize=12, fontname="helvetica-bold", color=(0.1, 0.2, 0.4))
+    page.draw_line((50, y+5), (550, y+5), color=(0.1, 0.2, 0.4), width=1.0)
+    y += 25
+    
+    # Table header
+    page.insert_text((50, y), "Product / Description", fontsize=9, fontname="helvetica-bold")
+    page.insert_text((240, y), "HSN/SAC", fontsize=9, fontname="helvetica-bold")
+    page.insert_text((330, y), "Qty", fontsize=9, fontname="helvetica-bold")
+    page.insert_text((380, y), "Unit Price", fontsize=9, fontname="helvetica-bold")
+    page.insert_text((470, y), "Amount", fontsize=9, fontname="helvetica-bold")
+    y += 15
+    page.draw_line((50, y), (550, y), color=(0.7, 0.7, 0.7), width=0.5)
+    y += 15
+    
+    for item in invoice_data.get("items", []):
+        if y > 700:
+            page = doc.new_page()
+            y = 50
+        prod = (item.get("product") or item.get("description", ""))[:32]
+        page.insert_text((50, y), prod, fontsize=9, fontname="helvetica")
+        page.insert_text((240, y), str(item.get("hsn_sac", "N/A")), fontsize=9, fontname="helvetica")
+        page.insert_text((330, y), str(item.get("quantity", 0)), fontsize=9, fontname="helvetica")
+        page.insert_text((380, y), f"Rs. {float(item.get('unit_price',0)):,.2f}", fontsize=9, fontname="helvetica")
+        page.insert_text((470, y), f"Rs. {float(item.get('amount',0)):,.2f}", fontsize=9, fontname="helvetica")
+        y += 18
+        
+    y += 15
+    page.draw_line((50, y), (550, y), color=(0.7, 0.7, 0.7), width=0.5)
+    y += 15
+    
+    totals = [
+        ("Taxable Subtotal:", invoice_data.get("amount", 0)),
+        ("Discount:", invoice_data.get("discount", 0)),
+        ("Tax Amount:", invoice_data.get("tax", 0)),
+        ("Grand Total:", invoice_data.get("total", 0)),
+    ]
+    for label, val in totals:
+        page.insert_text((330, y), label, fontsize=9, fontname="helvetica-bold")
+        page.insert_text((470, y), f"Rs. {float(val):,.2f}", fontsize=9, fontname="helvetica")
+        y += 15
+        
+    # Audit issues
+    y += 15
+    page.insert_text((50, y), "AUDIT FINDINGS & ISSUES", fontsize=12, fontname="helvetica-bold", color=(0.1, 0.2, 0.4))
+    page.draw_line((50, y+5), (550, y+5), color=(0.1, 0.2, 0.4), width=1.0)
+    y += 25
+    
+    issues = audit_result.get("issues", [])
+    if not issues:
+        page.insert_text((50, y), "No issues detected. Invoice is valid.", fontsize=10, fontname="helvetica", color=(0.1, 0.6, 0.1))
+    else:
+        for issue in issues:
+            if y > 750:
+                page = doc.new_page()
+                y = 50
+            severity = str(issue.get("severity", "medium")).upper()
+            msg = issue.get("message", "")
+            color = (0.8, 0.1, 0.1) if severity == "HIGH" else (0.7, 0.5, 0.1)
+            page.insert_text((50, y), f"[{severity}] {msg}", fontsize=9, fontname="helvetica-bold", color=color)
+            y += 15
+            
+    pdf_bytes = doc.write()
+    doc.close()
+    return pdf_bytes
+
+
+# --- App Title ---
 st.title("AI Audit Agent")
 
-st.markdown('<div class="section">', unsafe_allow_html=True)
-st.markdown('<div class="section-title">Upload Invoice</div>', unsafe_allow_html=True)
-uploaded_file = st.file_uploader(
-    "Drag and drop invoice image or PDF",
-    type=["png", "jpg", "jpeg", "pdf"],
-    label_visibility="collapsed",
-)
+# --- Tab Setup ---
+tab_upload, tab_search, tab_dashboard = st.tabs([
+    "📤 Upload & Audit",
+    "🔍 Search & Details",
+    "📊 Dashboard"
+])
 
-run_button = st.button("Run Audit", type="primary", use_container_width=True)
-st.markdown("</div>", unsafe_allow_html=True)
+# --- Tab 1: Upload & Audit ---
+with tab_upload:
+    st.markdown('<div class="section">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Upload Invoice</div>', unsafe_allow_html=True)
+    uploaded_file = st.file_uploader(
+        "Drag and drop invoice image or PDF",
+        type=["png", "jpg", "jpeg", "pdf"],
+        label_visibility="collapsed",
+        key="uploader_tab1"
+    )
 
-if run_button and uploaded_file:
-    file_path = save_uploaded_file(uploaded_file)
+    run_button = st.button("Run Audit", type="primary", use_container_width=True, key="run_btn_tab1")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    with st.spinner("Audit agent is reading and checking the invoice..."):
-        invoice_data, audit_result, audit_summary, validation_errors = run_audit_pipeline(str(file_path))
+    if run_button and uploaded_file:
+        file_path = save_uploaded_file(uploaded_file)
 
-    if validation_errors:
-        file_path.unlink(missing_ok=True)
-        st.session_state.invoice_data = None
-        st.session_state.audit_result = None
-        st.session_state.audit_summary = ""
-        st.session_state.messages = []
-        st.error("This document does not appear to be a valid invoice.")
+        with st.spinner("Audit agent is reading and checking the invoice..."):
+            invoice_data, audit_result, audit_summary, validation_errors = run_audit_pipeline(str(file_path))
 
-        for error in validation_errors:
-            st.warning(error)
+        if validation_errors:
+            file_path.unlink(missing_ok=True)
+            st.session_state.invoice_data = None
+            st.session_state.audit_result = None
+            st.session_state.audit_summary = ""
+            st.session_state.messages = []
+            st.error("This document does not appear to be a valid invoice.")
 
-        st.stop()
-
-    st.session_state.invoice_data = invoice_data
-    st.session_state.audit_result = audit_result
-    st.session_state.audit_summary = audit_summary
-    st.session_state.messages = []
-
-    # Persist audit record to MongoDB (if configured)
-    try:
-        invoice_no = (
-            invoice_data.get("invoice_no")
-            or invoice_data.get("invoice_number")
-            or invoice_data.get("number")
-            or ""
-        )
-
-        invoice_date = (
-            invoice_data.get("date")
-            or invoice_data.get("invoice_date")
-            or ""
-        )
-
-        record = {
-            "document_type": invoice_data.get("document_type", ""),
-            "invoice_no": invoice_no,
-            "date": invoice_date,
-            "vendor": invoice_data.get("vendor", ""),
-            "customer_name": invoice_data.get("customer_name", ""),
-            "gstin": invoice_data.get("gstin", ""),
-            "category": invoice_data.get("category", ""),
-            "amount": invoice_data.get("amount", 0),
-            "discount": invoice_data.get("discount", 0),
-            "tax": invoice_data.get("tax", 0),
-            "total": invoice_data.get("total", invoice_data.get("grand_total", 0)),
-            "payment_method": invoice_data.get("payment_method", ""),
-            "ocr_quality": invoice_data.get("ocr_quality", ""),
-            "items": invoice_data.get("items", []),
-            "audit_flags": invoice_data.get("audit_flags", []),
-            "audit_status": audit_result.get("status"),
-            "risk_score": audit_result.get("risk_score", 100),
-            "issue_count": audit_result.get("issue_count", len(audit_result.get("issues", []))),
-            "debugging_info": audit_result.get("debugging_info", {}),
-            "created_at": datetime.utcnow(),
-        }
-
-        duplicate = find_duplicate_invoice(record)
-        if duplicate:
-            audit_flags = invoice_data.setdefault("audit_flags", [])
-            if "duplicate_candidate" not in audit_flags:
-                audit_flags.append("duplicate_candidate")
-
-            audit_result = audit_invoice(invoice_data)
-            audit_summary = create_audit_summary(invoice_data, audit_result)
-            st.session_state.invoice_data = invoice_data
-            st.session_state.audit_result = audit_result
-            st.session_state.audit_summary = audit_summary
-            save_json(invoice_data, "outputs/extracted_data.json")
-            save_json(audit_result, "outputs/audit_report.json")
-            save_text(audit_summary, "outputs/audit_report.txt")
-            st.warning("Duplicate invoice detected - the record already exists in the database.")
+            for error in validation_errors:
+                st.warning(error)
         else:
-            inserted_id = save_invoice_record(record)
-            st.success("Invoice saved successfully.")
-    except Exception as e:
-        st.error(f"Failed to save audit record to database: {e}")
-
-if run_button and not uploaded_file:
-    st.warning("Please upload an invoice file first.")
-
-st.markdown('<div class="section">', unsafe_allow_html=True)
-st.markdown('<div class="section-title">Edit Existing Invoice</div>', unsafe_allow_html=True)
-
-col1, col2 = st.columns([3, 1])
-with col1:
-    search_invoice_no = st.text_input(
-        "Enter invoice number to edit",
-        value="",
-        placeholder="e.g., INV001",
-        key="search_invoice",
-        help="Search for an existing invoice in the database.",
-    )
-
-with col2:
-    search_button = st.button("Search", key="search_btn", use_container_width=True)
-
-if search_button and search_invoice_no:
-    found_invoice = get_invoice_by_number(search_invoice_no.strip())
-    if found_invoice:
-        st.session_state.editing_invoice = found_invoice
-        st.success(f"Invoice {search_invoice_no} loaded for editing.")
-    else:
-        st.error(f"No invoice record found for {search_invoice_no}.")
-
-if "editing_invoice" in st.session_state and st.session_state.editing_invoice is not None:
-    editing_invoice = st.session_state.editing_invoice
-    invoice_no_from_db = editing_invoice.get("invoice_no", "")
-    st.markdown("**Current Invoice Data:**")
-    
-    edited_vendor = st.text_input(
-        "Vendor",
-        value=editing_invoice.get("vendor", ""),
-        key="edit_vendor",
-    )
-    
-    edited_date = st.text_input(
-        "Date",
-        value=editing_invoice.get("date", ""),
-        key="edit_date",
-    )
-    
-    edited_category = st.text_input(
-        "Category",
-        value=editing_invoice.get("category", ""),
-        key="edit_category",
-    )
-    
-    edited_amount = st.number_input(
-        "Amount",
-        value=float(editing_invoice.get("amount", 0)),
-        key="edit_amount",
-    )
-    
-    edited_tax = st.number_input(
-        "Tax",
-        value=float(editing_invoice.get("tax", 0)),
-        key="edit_tax",
-    )
-    
-    edited_total = st.number_input(
-        "Total",
-        value=float(editing_invoice.get("total", 0)),
-        key="edit_total",
-    )
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        save_edit_button = st.button("Save Changes", type="primary", use_container_width=True)
-    
-    with col2:
-        re_audit_button = st.button("Save & Re-Audit", use_container_width=True)
-    
-    if save_edit_button and invoice_no_from_db:
-        updates = {
-            "vendor": edited_vendor.strip(),
-            "date": edited_date.strip(),
-            "category": edited_category.strip(),
-            "amount": float(edited_amount),
-            "tax": float(edited_tax),
-            "total": float(edited_total),
-        }
-        
-        try:
-            success = update_invoice_record(invoice_no_from_db, updates)
-            if success:
-                st.session_state.editing_invoice = {**editing_invoice, **updates}
-                st.success("Invoice updated successfully!")
-            else:
-                st.error(f"Failed to update invoice {invoice_no_from_db}.")
-        except Exception as e:
-            st.error(f"Error updating invoice: {e}")
-    
-    if re_audit_button and invoice_no_from_db:
-        updates = {
-            "vendor": edited_vendor.strip(),
-            "date": edited_date.strip(),
-            "category": edited_category.strip(),
-            "amount": float(edited_amount),
-            "tax": float(edited_tax),
-            "total": float(edited_total),
-        }
-        
-        try:
-            # Update invoice with edited data
-            success = update_invoice_record(invoice_no_from_db, updates)
-            if not success:
-                st.error(f"Failed to save changes to invoice {invoice_no_from_db}.")
-                st.stop()
-            
-            # Prepare invoice data for audit
-            invoice_data = {
-                "document_type": editing_invoice.get("document_type", ""),
-                "invoice_no": invoice_no_from_db,
-                "date": edited_date.strip(),
-                "vendor": edited_vendor.strip(),
-                "customer_name": editing_invoice.get("customer_name", ""),
-                "gstin": editing_invoice.get("gstin", ""),
-                "category": edited_category.strip(),
-                "amount": float(edited_amount),
-                "tax": float(edited_tax),
-                "total": float(edited_total),
-                "payment_method": editing_invoice.get("payment_method", ""),
-                "ocr_quality": editing_invoice.get("ocr_quality", ""),
-                "items": editing_invoice.get("items", []),
-                "audit_flags": editing_invoice.get("audit_flags", []),
-            }
-            
-            # Run audit
-            with st.spinner("Running audit on updated invoice..."):
-                audit_result = audit_invoice(invoice_data)
-                audit_summary = create_audit_summary(invoice_data, audit_result)
-            
-            # Update audit results in database
-            audit_updates = {
-                "audit_status": audit_result.get("status"),
-                "risk_score": audit_result.get("risk_score", 100),
-                "issue_count": audit_result.get("issue_count", len(audit_result.get("issues", []))),
-            }
-            
-            update_success = update_invoice_record(invoice_no_from_db, audit_updates)
-            if not update_success:
-                st.warning("Re-audit completed but could not save audit results to database.")
-            
-            # Update session state
             st.session_state.invoice_data = invoice_data
             st.session_state.audit_result = audit_result
             st.session_state.audit_summary = audit_summary
             st.session_state.messages = []
-            st.session_state.editing_invoice = None
-            
-            st.success("Invoice updated and re-audited successfully!")
-            st.rerun()
-            
-        except Exception as e:
-            st.error(f"Error during re-audit: {str(e)}")
 
-st.markdown("</div>", unsafe_allow_html=True)
+            # Persist audit record to MongoDB
+            try:
+                invoice_no = (
+                    invoice_data.get("invoice_no")
+                    or invoice_data.get("invoice_number")
+                    or ""
+                )
 
-st.markdown('<div class="section">', unsafe_allow_html=True)
-st.markdown('<div class="section-title">&#129302; Audit Agent Analysis</div>', unsafe_allow_html=True)
+                invoice_date = (
+                    invoice_data.get("date")
+                    or invoice_data.get("invoice_date")
+                    or ""
+                )
 
-audit_result = st.session_state.get("audit_result")
-invoice_data = st.session_state.get("invoice_data")
+                record = {
+                    "document_type": invoice_data.get("document_type", ""),
+                    "invoice_no": invoice_no,
+                    "date": invoice_date,
+                    "vendor": invoice_data.get("vendor", ""),
+                    "customer_name": invoice_data.get("customer_name", ""),
+                    "gstin": invoice_data.get("gstin", ""),
+                    "category": invoice_data.get("category", ""),
+                    "classification": invoice_data.get("classification", "Expense"),
+                    "amount": invoice_data.get("amount", 0),
+                    "discount": invoice_data.get("discount", 0),
+                    "tax": invoice_data.get("tax", 0),
+                    "total": invoice_data.get("total", 0),
+                    "payment_method": invoice_data.get("payment_method", ""),
+                    "ocr_quality": invoice_data.get("ocr_quality", ""),
+                    "items": invoice_data.get("items", []),
+                    "audit_flags": invoice_data.get("audit_flags", []),
+                    "audit_status": audit_result.get("status"),
+                    "risk_score": audit_result.get("risk_score", 100),
+                    "issue_count": audit_result.get("issue_count", 0),
+                    "issues": audit_result.get("issues", []),
+                    "debugging_info": audit_result.get("debugging_info", {}),
+                    "created_at": datetime.utcnow(),
+                }
 
-if audit_result:
-    st.markdown(
-        f"""
-        <div class="analysis-hero">
-            <div class="analysis-eyebrow">AI AUDIT ANALYSIS</div>
-            <div class="hero-status">{status_icon(audit_result["status"])} {status_label(audit_result["status"])}</div>
-            <div class="risk-score">Risk Score: {risk_score(audit_result)}/100</div>
-            <div class="hero-decision">{decision_text(audit_result)}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+                duplicate = find_duplicate_invoice(record)
+                if duplicate:
+                    audit_flags = invoice_data.setdefault("audit_flags", [])
+                    if "duplicate_candidate" not in audit_flags:
+                        audit_flags.append("duplicate_candidate")
 
-    render_kpi_cards(audit_result, invoice_data)
-    st.markdown(
-        f"""
-        <div class="status-card {status_tone(audit_result["status"])}">
-            <div class="status-head">
-                <div class="status-line">Audit Findings</div>
-                <div class="status-badge {status_tone(audit_result["status"])}">{audit_result["issue_count"]} issues</div>
+                    audit_result = audit_invoice(invoice_data)
+                    audit_summary = create_audit_summary(invoice_data, audit_result)
+                    st.session_state.invoice_data = invoice_data
+                    st.session_state.audit_result = audit_result
+                    st.session_state.audit_summary = audit_summary
+                    save_json(invoice_data, "outputs/extracted_data.json")
+                    save_json(audit_result, "outputs/audit_report.json")
+                    save_text(audit_summary, "outputs/audit_report.txt")
+                    st.warning("Duplicate invoice detected - the record already exists in the database.")
+                else:
+                    inserted_id = save_invoice_record(record)
+                    st.success("Invoice saved successfully.")
+            except Exception as e:
+                st.error(f"Failed to save audit record to database: {e}")
+
+    # Output details
+    audit_result_t1 = st.session_state.get("audit_result")
+    invoice_data_t1 = st.session_state.get("invoice_data")
+
+    if audit_result_t1:
+        st.markdown('<div class="section">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">&#129302; Audit Agent Analysis</div>', unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <div class="analysis-hero">
+                <div class="analysis-eyebrow">AI AUDIT ANALYSIS</div>
+                <div class="hero-status">{status_icon(audit_result_t1["status"])} {status_label(audit_result_t1["status"])}</div>
+                <div class="risk-score">Risk Score: {risk_score(audit_result_t1)}/100</div>
+                <div class="hero-decision">{decision_text(audit_result_t1)}</div>
             </div>
-            {render_issue_html(audit_result)}
-        </div>
-        <div class="summary-card">
-            <div class="summary-title">AI Summary</div>
-            <div class="summary-body">{ai_summary_text(audit_result, invoice_data)}</div>
-            <div class="recommendation">{recommendation_text(audit_result)}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-else:
-    waiting_result = {"status": "waiting", "issue_count": 0, "issues": []}
-    st.markdown(
-        """
-        <div class="analysis-hero">
-            <div class="analysis-eyebrow">AI AUDIT ANALYSIS</div>
-            <div class="hero-status">Waiting</div>
-            <div class="risk-score">Risk Score: --/100</div>
-            <div class="hero-decision">Upload an invoice and run the audit.</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    render_kpi_cards(waiting_result, invoice_data)
+            """,
+            unsafe_allow_html=True,
+        )
 
-if invoice_data:
-    with st.expander("Invoice preview and extracted fields", expanded=False):
-        render_invoice_preview(uploaded_file)
-        st.markdown("**Invoice Summary**")
-        render_invoice_summary(invoice_data)
-        render_line_items(invoice_data)
-        render_audit_flags(invoice_data)
-elif uploaded_file:
-    with st.expander("Invoice preview", expanded=False):
-        render_invoice_preview(uploaded_file)
+        render_kpi_cards(audit_result_t1, invoice_data_t1)
+        st.markdown(
+            f"""
+            <div class="status-card {status_tone(audit_result_t1["status"])}">
+                <div class="status-head">
+                    <div class="status-line">Audit Findings</div>
+                    <div class="status-badge {status_tone(audit_result_t1["status"])}">{audit_result_t1["issue_count"]} issues</div>
+                </div>
+                {render_issue_html(audit_result_t1)}
+            </div>
+            <div class="summary-card">
+                <div class="summary-title">AI Summary</div>
+                <div class="summary-body">{ai_summary_text(audit_result_t1, invoice_data_t1)}</div>
+                <div class="recommendation">{recommendation_text(audit_result_t1)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-st.markdown("</div>", unsafe_allow_html=True)
+        with st.expander("Invoice preview and fields", expanded=False):
+            render_invoice_preview(uploaded_file)
+            st.markdown("**Invoice Summary**")
+            render_invoice_summary(invoice_data_t1)
+            render_line_items(invoice_data_t1)
+            render_audit_flags(invoice_data_t1)
+        
+        # Download/Export actions
+        st.markdown("### Export Invoice")
+        col1, col2 = st.columns(2)
+        with col1:
+            csv_data = generate_invoice_csv(invoice_data_t1)
+            st.download_button(
+                label="Download CSV",
+                data=csv_data,
+                file_name=f"invoice_{invoice_data_t1.get('invoice_no', 'export')}.csv",
+                mime="text/csv",
+                key="csv_download_t1"
+            )
+        with col2:
+            pdf_data = generate_invoice_pdf(invoice_data_t1, audit_result_t1)
+            st.download_button(
+                label="Download PDF Report",
+                data=pdf_data,
+                file_name=f"audit_report_{invoice_data_t1.get('invoice_no', 'export')}.pdf",
+                mime="application/pdf",
+                key="pdf_download_t1"
+            )
+        st.markdown("</div>", unsafe_allow_html=True)
+    
+    st.markdown('<div class="section">', unsafe_allow_html=True)
+    render_chat()
+    st.markdown("</div>", unsafe_allow_html=True)
 
-st.markdown('<div class="section">', unsafe_allow_html=True)
-render_chat()
-st.markdown("</div>", unsafe_allow_html=True)
+
+# --- Tab 2: Search & Details ---
+with tab_search:
+    st.markdown('<div class="section">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Search Invoices</div>', unsafe_allow_html=True)
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        s_inv_no = st.text_input("Invoice Number", placeholder="e.g., INV-001", key="s_inv_no")
+        s_vendor = st.text_input("Vendor", placeholder="e.g., Amazon", key="s_vendor")
+        s_cust = st.text_input("Customer", placeholder="e.g., Rahul", key="s_cust")
+        s_gstin = st.text_input("GSTIN", placeholder="e.g., 27AAAAA1111A1Z5", key="s_gstin")
+    with col2:
+        s_cat = st.text_input("Category", placeholder="e.g., Retail", key="s_cat")
+        s_status = st.selectbox("Status", ["All", "Passed", "Warning", "Failed"], key="s_status")
+        s_class = st.selectbox("Classification", ["All", "Purchase", "Sales", "Expense"], key="s_class")
+        s_date = st.text_input("Date", placeholder="YYYY-MM-DD", key="s_date")
+        
+    search_triggered = st.button("Search Database", type="primary", use_container_width=True, key="search_triggered_btn")
+    st.markdown("</div>", unsafe_allow_html=True)
+    
+    # Run search query
+    query_params = {}
+    if s_inv_no: query_params["invoice_no"] = s_inv_no
+    if s_vendor: query_params["vendor"] = s_vendor
+    if s_cust: query_params["customer_name"] = s_cust
+    if s_gstin: query_params["gstin"] = s_gstin
+    if s_cat: query_params["category"] = s_cat
+    if s_status != "All": query_params["status"] = s_status
+    if s_class != "All": query_params["classification"] = s_class
+    if s_date: query_params["date"] = s_date
+    
+    matching_invoices = []
+    if search_triggered or s_inv_no or s_vendor or s_cust or s_gstin or s_cat or s_date or s_status != "All" or s_class != "All":
+        matching_invoices = search_invoices(query_params)
+    else:
+        # Default load all invoices
+        matching_invoices = get_all_invoices()
+        
+    if matching_invoices:
+        st.markdown(f"**Found {len(matching_invoices)} invoices:**")
+        
+        # Display simplified table
+        table_rows = []
+        for inv in matching_invoices:
+            table_rows.append({
+                "Invoice No": inv.get("invoice_no", "N/A"),
+                "Vendor": inv.get("vendor", "N/A"),
+                "Date": inv.get("date", "N/A"),
+                "Category": inv.get("category", "N/A"),
+                "Classification": inv.get("classification", "Expense"),
+                "Total": f"Rs. {float(inv.get('total', 0)):,.2f}",
+                "Status": str(inv.get("audit_status", "unknown")).upper()
+            })
+        st.dataframe(table_rows, use_container_width=True, hide_index=True)
+        
+        # Select box for detailed page view
+        dropdown_options = [f"{inv.get('invoice_no')} | {inv.get('vendor')} | Total: Rs. {float(inv.get('total',0)):,.2f}" for inv in matching_invoices]
+        selected_option = st.selectbox("Select invoice to view complete details page:", dropdown_options, key="select_details_drop")
+        
+        if selected_option:
+            selected_inv_no = selected_option.split(" | ")[0].strip()
+            # Fetch complete invoice from Mongo
+            invoice = get_invoice_by_number(selected_inv_no)
+            if invoice:
+                # Re-run or construct audit report
+                audit_res = {
+                    "status": invoice.get("audit_status", "passed"),
+                    "risk_score": invoice.get("risk_score", 100),
+                    "issue_count": invoice.get("issue_count", 0),
+                    "issues": invoice.get("issues", [])
+                }
+                
+                st.markdown("---")
+                st.subheader(f"📄 Invoice Details: {selected_inv_no}")
+                
+                # Render Detailed view
+                st.markdown(
+                    f"""
+                    <div class="analysis-hero">
+                        <div class="analysis-eyebrow">STORED AI AUDIT REPORT</div>
+                        <div class="hero-status">{status_icon(audit_res["status"])} {status_label(audit_res["status"])}</div>
+                        <div class="risk-score">Risk Score: {audit_res["risk_score"]}/100</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                
+                col_d1, col_d2 = st.columns(2)
+                with col_d1:
+                    st.write(f"**Vendor:** {invoice.get('vendor', 'N/A')}")
+                    st.write(f"**Customer Name:** {invoice.get('customer_name', 'N/A')}")
+                    st.write(f"**Invoice Date:** {invoice.get('date', 'N/A')}")
+                    st.write(f"**GSTIN:** {invoice.get('gstin', 'N/A')}")
+                with col_d2:
+                    cls_val = str(invoice.get("classification") or "Expense").strip().title()
+                    cls_disp = "🟠 Expense"
+                    if cls_val == "Purchase":
+                        cls_disp = "🟢 Purchase"
+                    elif cls_val == "Sales":
+                        cls_disp = "🔵 Sales"
+                    st.write(f"**Category:** {invoice.get('category', 'N/A')}")
+                    st.write(f"**Classification:** {cls_disp}")
+                    st.write(f"**Subtotal:** Rs. {float(invoice.get('amount', 0)):,.2f}")
+                    st.write(f"**Total Amount:** Rs. {float(invoice.get('total', 0)):,.2f}")
+
+                
+                # Product Table
+                st.markdown("**Product Table**")
+                render_line_items(invoice)
+                
+                # Audit findings
+                st.markdown(
+                    f"""
+                    <div class="status-card {status_tone(audit_res["status"])}">
+                        <div class="status-head">
+                            <div class="status-line">Audit Findings / Issues</div>
+                            <div class="status-badge {status_tone(audit_res["status"])}">{audit_res["issue_count"]} issues</div>
+                        </div>
+                        {render_issue_html(audit_res)}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                
+                # Export options for stored record
+                col1, col2 = st.columns(2)
+                with col1:
+                    csv_data = generate_invoice_csv(invoice)
+                    st.download_button(
+                        label="Download CSV Export",
+                        data=csv_data,
+                        file_name=f"invoice_{selected_inv_no}.csv",
+                        mime="text/csv",
+                        key="csv_download_t2"
+                    )
+                with col2:
+                    pdf_data = generate_invoice_pdf(invoice, audit_res)
+                    st.download_button(
+                        label="Download PDF Report",
+                        data=pdf_data,
+                        file_name=f"audit_report_{selected_inv_no}.pdf",
+                        mime="application/pdf",
+                        key="pdf_download_t2"
+                    )
+    else:
+        st.info("No matching records found in database.")
+
+
+
+# --- Tab 3: Dashboard ---
+with tab_dashboard:
+    st.markdown('<div class="section">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">📊 Analytics Dashboard</div>', unsafe_allow_html=True)
+    
+    invoices = get_all_invoices()
+    if invoices:
+        total_invs = len(invoices)
+        passed_count = sum(1 for inv in invoices if str(inv.get("audit_status")).lower() == "passed")
+        warning_count = sum(1 for inv in invoices if str(inv.get("audit_status")).lower() == "warning")
+        failed_count = sum(1 for inv in invoices if str(inv.get("audit_status")).lower() == "failed")
+        
+        # Display KPI cards
+        st.markdown(
+            f"""
+            <div class="kpi-grid">
+                <div class="kpi-card">
+                    <div class="kpi-label">Total Invoices</div>
+                    <div class="kpi-value">{total_invs}</div>
+                </div>
+                <div class="kpi-card" style="border-left: 4px solid #22c55e;">
+                    <div class="kpi-label">Passed</div>
+                    <div class="kpi-value" style="color: #22c55e;">{passed_count}</div>
+                </div>
+                <div class="kpi-card" style="border-left: 4px solid #f59e0b;">
+                    <div class="kpi-label">Warning</div>
+                    <div class="kpi-value" style="color: #f59e0b;">{warning_count}</div>
+                </div>
+                <div class="kpi-card" style="border-left: 4px solid #ef4444;">
+                    <div class="kpi-label">Failed</div>
+                    <div class="kpi-value" style="color: #ef4444;">{failed_count}</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        
+        # Analytics breakdown calculations
+        cat_counts = {}
+        class_counts = {"Purchase": 0, "Sales": 0, "Expense": 0}
+        total_score = 0
+        
+        for inv in invoices:
+            cat = str(inv.get("category") or "Uncategorized").strip()
+            cat_counts[cat] = cat_counts.get(cat, 0) + 1
+            
+            cls = inv.get("classification")
+            if not cls:
+                # Dynamically classify older stored database invoices
+                dummy_data = {
+                    "document_type": inv.get("document_type", ""),
+                    "category": inv.get("category", "")
+                }
+                text_context = f"{inv.get('vendor', '')} {inv.get('category', '')}"
+                cls = _classify_invoice(dummy_data, text_context)
+
+            cls = str(cls).strip().title()
+            if cls in class_counts:
+                class_counts[cls] += 1
+            else:
+                class_counts["Expense"] += 1
+
+                
+            total_score += inv.get("risk_score", 100)
+            
+        avg_score = round(total_score / total_invs, 1)
+        
+        col_db1, col_db2 = st.columns(2)
+        with col_db1:
+            st.markdown("**Category-wise Distribution**")
+            st.bar_chart(cat_counts)
+        with col_db2:
+            st.markdown("**Classification Metrics**")
+            st.dataframe([
+                {"Classification": k, "Invoices": v} for k, v in class_counts.items()
+            ], use_container_width=True, hide_index=True)
+            
+            st.markdown(
+                f"""
+                <div style="background: rgba(15, 23, 42, 0.85); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 18px; text-align: center; margin-top: 15px;">
+                    <div style="font-size: 0.82rem; color: #94a3b8; font-weight: 700;">AVERAGE RISK SCORE</div>
+                    <div style="font-size: 2rem; font-weight: 800; color: #a5b4fc;">{avg_score} / 100</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+    else:
+        st.info("No analytics data available. Insert invoices to display metrics.")
