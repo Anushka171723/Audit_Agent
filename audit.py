@@ -8,12 +8,12 @@ REQUIRED_FIELDS = [
     "vendor",
     "customer_name",
     "gstin",
-    "category",
+    "classification",
     "document_type",
     "amount",
     "total",
 ]
-HIGH_AMOUNT_LIMIT = 100000
+HIGH_AMOUNT_LIMIT = 100_000
 TOTAL_TOLERANCE = 1.0
 GSTIN_PATTERN = re.compile(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$")
 ISSUE_PENALTIES = {
@@ -159,63 +159,52 @@ def audit_invoice(invoice_data: dict) -> dict:
     total = _to_float(invoice_data.get("total"))
     items = invoice_data.get("items") if isinstance(invoice_data.get("items"), list) else []
 
-    # Calculate line items total
+    # ── Financial reconciliation ──────────────────────────────────────
+    # Rule: taxable = subtotal(items) - discount
+    #       total   = taxable + GST
     line_items_total = sum(_to_float(item.get("amount")) for item in items if isinstance(item, dict))
 
-    # Financial reconciliation: Validate the calculation chain
-    # taxable_amount = line_items_total - discount
-    # grand_total = taxable_amount + tax
-    
+    if items and line_items_total > 0:
+        calculated_taxable = round(line_items_total - discount, 2)
+    else:
+        calculated_taxable = round(amount - discount, 2)
+
+    calculated_total = round(calculated_taxable + tax, 2)
+
     debugging_info = {
         "calculated_line_items_total": round(line_items_total, 2),
-        "calculated_taxable_amount": 0.0,
-        "calculated_total": 0.0,
-        "extracted_amount": round(amount, 2),
-        "extracted_discount": round(discount, 2),
-        "extracted_tax": round(tax, 2),
-        "extracted_total": round(total, 2),
-        "difference": 0.0,
+        "calculated_taxable_amount":   round(calculated_taxable, 2),
+        "calculated_total":            round(calculated_total, 2),
+        "extracted_amount":            round(amount, 2),
+        "extracted_discount":          round(discount, 2),
+        "extracted_tax":               round(tax, 2),
+        "extracted_total":             round(total, 2),
+        "difference":                  round(abs(calculated_total - total), 2),
     }
 
-    # Calculate taxable amount (after discount)
+    # Line-item subtotal must match stored amount (pre-discount)
     if items and line_items_total > 0:
-        calculated_taxable_amount = line_items_total - discount
-    else:
-        calculated_taxable_amount = amount  # Fallback to extracted amount if no items
-
-    # Calculate expected total
-    calculated_total = calculated_taxable_amount + tax
-
-    debugging_info["calculated_taxable_amount"] = round(calculated_taxable_amount, 2)
-    debugging_info["calculated_total"] = round(calculated_total, 2)
-    debugging_info["difference"] = round(abs(calculated_total - total), 2)
-
-    # Validate line items reconciliation
-    if items and line_items_total > 0:
-        # Compare line items total with amount (after discount)
-        taxable_difference = abs(calculated_taxable_amount - amount)
-        if taxable_difference > TOTAL_TOLERANCE:
+        subtotal_diff = abs(line_items_total - amount)
+        if subtotal_diff > TOTAL_TOLERANCE:
             _add_issue(
                 issues,
                 "items",
-                f"Line item reconciliation mismatch: calculated taxable amount {calculated_taxable_amount:.2f}, found {amount:.2f}",
+                f"Line item subtotal {line_items_total:.2f} does not match stored amount {amount:.2f}",
                 "medium",
             )
 
-    # Validate total amount
     if amount <= 0:
         _add_issue(issues, "amount", "Amount should be greater than zero", "high")
 
     if total <= 0:
         _add_issue(issues, "total", "Total should be greater than zero", "high")
 
-    # Validate grand total against calculated total
-    total_difference = abs(calculated_total - total)
-    if total > 0 and total_difference > TOTAL_TOLERANCE:
+    # Grand total must equal taxable + GST
+    if total > 0 and abs(calculated_total - total) > TOTAL_TOLERANCE:
         _add_issue(
             issues,
             "total_mismatch",
-            f"Total mismatch: calculated {calculated_total:.2f}, found {total:.2f}",
+            f"Total mismatch: expected {calculated_total:.2f} (taxable {calculated_taxable:.2f} + GST {tax:.2f}), found {total:.2f}",
             "high",
         )
 
@@ -225,8 +214,14 @@ def audit_invoice(invoice_data: dict) -> dict:
     if amount > HIGH_AMOUNT_LIMIT:
         _add_issue(
             issues,
-            "amount",
-            f"Amount is above the review limit of {HIGH_AMOUNT_LIMIT}",
+            "high_value",
+            (
+                f"High Value Invoice | "
+                f"Invoice Amount: ₹{amount:,.0f} | "
+                f"Review Threshold: ₹{HIGH_AMOUNT_LIMIT:,.0f} | "
+                f"Invoices above this limit require manual approval. "
+                f"Verify purchase order and obtain manager approval before processing."
+            ),
             "medium",
         )
 
@@ -263,7 +258,8 @@ def create_audit_summary(invoice_data: dict, audit_result: dict) -> str:
         f"Vendor: {invoice_data.get('vendor') or 'Missing'}",
         f"Customer: {invoice_data.get('customer_name') or 'Missing'}",
         f"GSTIN: {invoice_data.get('gstin') or 'Missing'}",
-        f"Category: {invoice_data.get('category') or 'Missing'}",
+        f"Document Category: {invoice_data.get('category') or 'Missing'}",
+        f"Business Classification: {invoice_data.get('classification') or 'Missing'}",
         f"Amount: {invoice_data.get('amount')}",
         f"Discount: {invoice_data.get('discount', 0)}",
         f"Tax: {invoice_data.get('tax')}",
@@ -279,9 +275,12 @@ def create_audit_summary(invoice_data: dict, audit_result: dict) -> str:
         lines.append("Line Items:")
         for index, item in enumerate(items, start=1):
             lines.append(
-                f"{index}. {item.get('description') or 'Item'} | "
+                f"{index}. Product: {item.get('product') or 'Item'} | "
+                f"Description: {item.get('description') or 'N/A'} | "
+                f"HSN/SAC: {item.get('hsn_sac') or 'N/A'} | "
                 f"Qty: {item.get('quantity', 0)} | "
-                f"Unit: {item.get('unit_price', 0)} | "
+                f"Unit Price: {item.get('unit_price', 0)} | "
+                f"Tax: {item.get('tax', 0)} | "
                 f"Amount: {item.get('amount', 0)}"
             )
         lines.append("")

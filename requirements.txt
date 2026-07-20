@@ -3,6 +3,7 @@ Pillow
 PyMuPDF
 langchain
 langchain-groq
+
 pydantic
 python-dotenv
 streamlit
