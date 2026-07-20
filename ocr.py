@@ -1,13 +1,14 @@
+import platform
 from pathlib import Path
 import pytesseract
 from PIL import Image
 
 
-WINDOWS_TESSERACT_PATH = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
-
-
-if WINDOWS_TESSERACT_PATH.exists():
-    pytesseract.pytesseract.tesseract_cmd = str(WINDOWS_TESSERACT_PATH)
+# Set Tesseract path only on Windows — on Linux (Streamlit Cloud) it's in PATH
+if platform.system() == "Windows":
+    _win_path = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+    if _win_path.exists():
+        pytesseract.pytesseract.tesseract_cmd = str(_win_path)
 
 
 def _extract_text_from_pdf(path: Path) -> str:
